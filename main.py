@@ -7,22 +7,23 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # ------------------------------------------------------------------------
 
-import torch
 import argparse
-import datetime
-import json
 import random
-import time
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.utils.data as data
 from torch.utils.data import DataLoader
+
 import datasets
-import util.misc as utils
 import datasets.samplers as samplers
+import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch
+from datasets.coco import make_coco_transforms
+from engine import evaluate
 from models import build_model
+from util.misc import get_local_rank, get_local_size
 
 
 def get_args_parser():
@@ -195,11 +196,29 @@ def get_args_parser():
                         default=False,
                         action='store_true',
                         help='whether to cache images on memory')
+    parser.add_argument('--MEVA_video',
+                        default='',
+                        help='Path to MEVA avi file')
 
     return parser
 
 
+class MEVADataset(data.Dataset):
+
+    def __init__(self, meva_video_path, bigger) -> None:
+        # return_masks = False
+        # cache_mode = False
+        self.local_rank = get_local_rank()
+        self.local_size = get_local_size()
+        self._transforms = make_coco_transforms("val", bigger)
+
+    def __getitem__(self, idx):
+        img, _ = self._transforms(img, None)
+        return img, None
+
+
 def main(args):
+    print(args)
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -215,6 +234,7 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
+    # build model
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
@@ -223,31 +243,20 @@ def main(args):
                        if p.requires_grad)
     print('number of params:', n_parameters)
 
-    dataset_train = build_dataset(image_set='train', args=args)
+    # build datasets
     dataset_val = build_dataset(image_set='val', args=args)
+    # dataset_val = MEVADataset(args.MEVA_video, args.bigger)
 
     if args.distributed:
         if args.cache_mode:
-            sampler_train = samplers.NodeDistributedSampler(dataset_train)
             sampler_val = samplers.NodeDistributedSampler(dataset_val,
                                                           shuffle=False)
         else:
-            sampler_train = samplers.DistributedSampler(dataset_train)
             sampler_val = samplers.DistributedSampler(dataset_val,
                                                       shuffle=False)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    batch_sampler_train = torch.utils.data.BatchSampler(sampler_train,
-                                                        args.batch_size,
-                                                        drop_last=True)
-
-    data_loader_train = DataLoader(dataset_train,
-                                   batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn,
-                                   num_workers=args.num_workers,
-                                   pin_memory=True)
     data_loader_val = DataLoader(dataset_val,
                                  args.batch_size,
                                  sampler=sampler_val,
@@ -256,7 +265,6 @@ def main(args):
                                  num_workers=args.num_workers,
                                  pin_memory=True)
 
-    # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
     def match_name_keywords(n, name_keywords):
         out = False
         for b in name_keywords:
@@ -379,11 +387,6 @@ def main(args):
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
-        if not args.eval:
-            test_stats, coco_evaluator = evaluate(model, criterion,
-                                                  postprocessors,
-                                                  data_loader_val, base_ds,
-                                                  device, args.output_dir)
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
@@ -393,66 +396,6 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval,
                                  output_dir / "eval.pth")
         return
-
-    print("Start training")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(model, criterion, data_loader_train,
-                                      optimizer, device, epoch,
-                                      args.clip_max_norm)
-        lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 5 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
-                checkpoint_paths.append(output_dir /
-                                        f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master(
-                    {
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
-
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device,
-                                              args.output_dir)
-
-        log_stats = {
-            **{
-                f'train_{k}': v
-                for k, v in train_stats.items()
-            },
-            **{
-                f'test_{k}': v
-                for k, v in test_stats.items()
-            }, 'epoch': epoch,
-            'n_parameters': n_parameters
-        }
-
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-            # for evaluation logs
-            if coco_evaluator is not None:
-                (output_dir / 'eval').mkdir(exist_ok=True)
-                if "bbox" in coco_evaluator.coco_eval:
-                    filenames = ['latest.pth']
-                    if epoch % 50 == 0:
-                        filenames.append(f'{epoch:03}.pth')
-                    for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                   output_dir / "eval" / name)
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
