@@ -1,0 +1,1 @@
+./configs/deta.sh --coco_path ./data/coco --backbone swin --bigger --eval --resume adet_swin_fth.pth --MEVA_video ../ad-config-search/MEVA/2018-03-11.16-20-08.16-25-08.hospital.G436.r13.avi --num_workers 0 --batch_size 1
