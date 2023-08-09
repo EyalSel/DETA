@@ -2,3 +2,5 @@ pycocotools
 tqdm
 cython
 scipy
+opencv-python
+timm
