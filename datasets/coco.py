@@ -6,7 +6,6 @@
 # Modified from DETR (https://github.com/facebookresearch/detr)
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # ------------------------------------------------------------------------
-
 """
 COCO dataset which returns image_id for evaluation.
 
@@ -24,9 +23,20 @@ import datasets.transforms as T
 
 
 class CocoDetection(TvCocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, return_masks, cache_mode=False, local_rank=0, local_size=1):
-        super(CocoDetection, self).__init__(img_folder, ann_file,
-                                            cache_mode=cache_mode, local_rank=local_rank, local_size=local_size)
+
+    def __init__(self,
+                 img_folder,
+                 ann_file,
+                 transforms,
+                 return_masks,
+                 cache_mode=False,
+                 local_rank=0,
+                 local_size=1):
+        super(CocoDetection, self).__init__(img_folder,
+                                            ann_file,
+                                            cache_mode=cache_mode,
+                                            local_rank=local_rank,
+                                            local_size=local_size)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
 
@@ -58,6 +68,7 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class ConvertCocoPolysToMask(object):
+
     def __init__(self, return_masks=False):
         self.return_masks = return_masks
 
@@ -69,7 +80,9 @@ class ConvertCocoPolysToMask(object):
 
         anno = target["annotations"]
 
-        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
+        anno = [
+            obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0
+        ]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -112,7 +125,8 @@ class ConvertCocoPolysToMask(object):
 
         # for conversion to coco api
         area = torch.tensor([obj["area"] for obj in anno])
-        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
+        iscrowd = torch.tensor(
+            [obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
         target["area"] = area[keep]
         target["iscrowd"] = iscrowd[keep]
 
@@ -136,7 +150,7 @@ def make_coco_transforms(image_set, bigger):
 
     max_size = 1333
     if bigger:
-        scales = [int(1.5*s) for s in scales]
+        scales = [int(1.5 * s) for s in scales]
         max_size = 2000
 
     if image_set == 'train':
@@ -148,8 +162,7 @@ def make_coco_transforms(image_set, bigger):
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=max_size),
-                ])
-            ),
+                ])),
             normalize,
         ])
 
@@ -167,11 +180,19 @@ def build(image_set, args):
     assert root.exists(), f'provided COCO path {root} does not exist'
     mode = 'instances'
     PATHS = {
-        "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
-        "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
+        "train":
+        (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
+        "val":
+        (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, args.bigger), return_masks=args.masks,
-                            cache_mode=args.cache_mode, local_rank=get_local_rank(), local_size=get_local_size())
+    dataset = CocoDetection(img_folder,
+                            ann_file,
+                            transforms=make_coco_transforms(
+                                image_set, args.bigger),
+                            return_masks=args.masks,
+                            cache_mode=args.cache_mode,
+                            local_rank=get_local_rank(),
+                            local_size=get_local_size())
     return dataset
