@@ -11,17 +11,17 @@ import argparse
 import random
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.utils.data as data
+import torchvision
 from torch.utils.data import DataLoader
 
-import datasets
 import datasets.samplers as samplers
 import util.misc as utils
-from datasets import build_dataset, get_coco_api_from_dataset
 from datasets.coco import make_coco_transforms
-from engine import evaluate
+from engine import get_preds
 from models import build_model
 from util.misc import get_local_rank, get_local_size
 
@@ -59,25 +59,21 @@ def get_args_parser():
     parser.add_argument('--two_stage', default=False, action='store_true')
 
     # Model parameters
-    parser.add_argument(
-        '--frozen_weights',
-        type=str,
-        default=None,
-        help=
-        "Path to the pretrained model. If set, only the mask head will be trained"
-    )
+    parser.add_argument('--frozen_weights',
+                        type=str,
+                        default=None,
+                        help=("Path to the pretrained model. "
+                              "If set, only the mask head will be trained"))
 
     # * Backbone
     parser.add_argument('--backbone',
                         default='resnet50',
                         type=str,
                         help="Name of the convolutional backbone to use")
-    parser.add_argument(
-        '--dilation',
-        action='store_true',
-        help=
-        "If true, we replace stride with dilation in the last convolutional block (DC5)"
-    )
+    parser.add_argument('--dilation',
+                        action='store_true',
+                        help=("If true, we replace stride with dilation in "
+                              "the last convolutional block (DC5)"))
     parser.add_argument(
         '--position_embedding',
         default='sine',
@@ -107,9 +103,8 @@ def get_args_parser():
         '--dim_feedforward',
         default=1024,
         type=int,
-        help=
-        "Intermediate size of the feedforward layers in the transformer blocks"
-    )
+        help=("Intermediate size of the feedforward layers in the "
+              "transformer blocks"))
     parser.add_argument(
         '--hidden_dim',
         default=256,
@@ -203,18 +198,62 @@ def get_args_parser():
     return parser
 
 
+class MEVASensor:
+
+    def __init__(self, data_path):
+        cap = cv2.VideoCapture(str(data_path))
+        self.cap = cap
+        self.total_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def total_num_frames(self):
+        return self.total_length
+
+    def get_frame(self, frame_index):
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ret, frame = self.cap.read()
+        assert ret, frame_index
+        return {"center_camera_feed": frame}
+
+    def __del__(self):
+        self.cap.release()
+
+
 class MEVADataset(data.Dataset):
 
     def __init__(self, meva_video_path, bigger) -> None:
-        # return_masks = False
-        # cache_mode = False
         self.local_rank = get_local_rank()
         self.local_size = get_local_size()
+        # The MEVASensor uses cv2.VideoCapture, which apparently when set as a
+        # variable during the dataset init creates a deadlock in a multi-worker
+        # dataloader
+        # (https://discuss.pytorch.org/t/multiprocess-cv2-data-loader/54039).
+        # One way to apparently get around this is to initialize the
+        # cv2.VideoCapture on the first call to __getitem__.
+
+        # However, one issue is that the __len__ function needs the
+        # cv2.VideoCapture for the length of the avi video, so we resort to the
+        # cumbersome solution where the cv2.VideoLoader is created, the the
+        # length is retrieved, and then the cv2.VideoLoader structure is
+        # explicitly destroyed.
+        temp = MEVASensor(meva_video_path)
+        self.length = temp.total_num_frames()
+        del temp
+        self.sensor = None
+        self.meva_video_path = meva_video_path
         self._transforms = make_coco_transforms("val", bigger)
 
     def __getitem__(self, idx):
+        if self.sensor is None:
+            self.sensor = MEVASensor(self.meva_video_path)
+        img = self.sensor.get_frame(idx)["center_camera_feed"]
+        to_pil = torchvision.transforms.ToPILImage()
+        img = to_pil(img)
         img, _ = self._transforms(img, None)
-        return img, None
+        return img, {}
+
+    def __len__(self):
+        return 200
+        return self.length
 
 
 def main(args):
@@ -235,7 +274,7 @@ def main(args):
     random.seed(seed)
 
     # build model
-    model, criterion, postprocessors = build_model(args)
+    model, _, postprocessors = build_model(args)
     model.to(device)
 
     model_without_ddp = model
@@ -244,8 +283,8 @@ def main(args):
     print('number of params:', n_parameters)
 
     # build datasets
-    dataset_val = build_dataset(image_set='val', args=args)
-    # dataset_val = MEVADataset(args.MEVA_video, args.bigger)
+    # dataset_val = build_dataset(image_set='val', args=args)
+    dataset_val = MEVADataset(args.MEVA_video, args.bigger)
 
     if args.distributed:
         if args.cache_mode:
@@ -317,18 +356,10 @@ def main(args):
             model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
-        coco_val = datasets.coco.build("val", args)
-        base_ds = get_coco_api_from_dataset(coco_val)
-    else:
-        base_ds = get_coco_api_from_dataset(dataset_val)
-
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
-    output_dir = Path(args.output_dir)
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
         state_dict = checkpoint['model']
@@ -348,6 +379,7 @@ def main(args):
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
         print('finetuning from epoch', checkpoint['epoch'])
+
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(args.resume,
@@ -365,7 +397,8 @@ def main(args):
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        if (not args.eval and 'optimizer' in checkpoint
+                and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint):
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -374,12 +407,15 @@ def main(args):
                 pg['initial_lr'] = pg_old['initial_lr']
             print(optimizer.param_groups)
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler (e.g., decrease lr in advance).
+            # todo: this is a hack for doing experiment that resume from
+            # checkpoint and also modify lr scheduler (e.g., decrease lr in
+            # advance).
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
                 print(
-                    'Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.'
-                )
+                    'Warning: (hack) args.override_resumed_lr_drop is set to '
+                    'True, so args.lr_drop would override lr_drop in resumed '
+                    'lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(
                     map(lambda group: group['initial_lr'],
@@ -388,14 +424,15 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
 
-    if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device,
-                                              args.output_dir)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval,
-                                 output_dir / "eval.pth")
-        return
+    assert args.eval
+    video_path = args.MEVA_video
+    scenario = Path(video_path).name.replace(".avi", "")
+    get_preds(model,
+              postprocessors,
+              data_loader_val,
+              device,
+              args.output_dir,
+              scenario=scenario)
 
 
 if __name__ == '__main__':

@@ -33,10 +33,10 @@ swin_l_weights = 'weights/swin_large_patch4_window12_384_22k.pth'
 
 def get_swinl(**add_kwargs):
     model = SwinTransformer(**swin_l_kwargs, **add_kwargs)
-    state_dict = torch.load(swin_l_weights)
-    load_info = model.load_state_dict(state_dict['model'], strict=False)
-    print('Missing swin keys', load_info.missing_keys)
-    print('Unexpected swin keys', load_info.unexpected_keys)
+    # state_dict = torch.load(swin_l_weights)
+    # load_info = model.load_state_dict(state_dict['model'], strict=False)
+    # print('Missing swin keys', load_info.missing_keys)
+    # print('Unexpected swin keys', load_info.unexpected_keys)
     return model
 
 class Mlp(nn.Module):
