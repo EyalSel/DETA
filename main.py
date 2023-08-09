@@ -252,7 +252,6 @@ class MEVADataset(data.Dataset):
         return img, {}
 
     def __len__(self):
-        return 200
         return self.length
 
 
