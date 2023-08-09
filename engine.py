@@ -13,12 +13,15 @@ import math
 import os
 import sys
 from typing import Iterable
-from tqdm import tqdm
+
+import numpy as np
 import torch
+from tqdm import tqdm
+
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
-from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
+from datasets.panoptic_eval import PanopticEvaluator
 
 
 def train_one_epoch(model: torch.nn.Module,
@@ -213,11 +216,24 @@ def get_preds(model, postprocessors, data_loader, device, output_dir,
         ],
                                         dim=0).to(device)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
-        all_predictions.append({
-            "model_outputs": outputs,
-            "postprocessing_results": results,
-        })
 
-    with open(f"{output_dir}/meva_inference_{scenario}.pl", "wb") as f:
-        import pickle
-        pickle.dump(all_predictions, f)
+        for element in results:
+            boxes = element['boxes'].cpu().numpy()
+            scores = element['scores'].cpu().numpy()
+            labels = element['labels'].cpu().numpy()
+            # switching bbox schema from torch to TF-efficientdet
+            # [xmin, ymin, xmax, ymax] -> [ymin, xmin, ymax, xmax]
+
+            # Saving in TF-efficientdet schema [-1, ymn, xmn, ymx, xmx, score,
+            # label]
+            boxes = boxes[:, [1, 0, 3, 2]]
+            pred = np.concatenate([
+                np.array([-1 for _ in range(len(boxes))]).reshape(-1, 1), boxes,
+                scores.reshape(-1, 1),
+                labels.reshape(-1, 1)
+            ],
+                                axis=1)
+            all_predictions.append(pred)
+
+    all_predictions = np.array(all_predictions)
+    np.save(f"{output_dir}/preds--{scenario}__DETA.pl", all_predictions)
